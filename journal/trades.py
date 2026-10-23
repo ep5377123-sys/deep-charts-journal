@@ -3,10 +3,15 @@
 A trade runs flat -> flat per (firm, account, symbol), in time order. Deep Charts' position id
 is not used for grouping: each scale-in order gets its own id, and a platform restart can give
 the exit a new id.
+
+Replay (backtest) fills land in the file for the day the replay ran but carry the replayed
+market time, so their date is earlier than the file's. They become "Replay" trades, grouped per
+replay day so the same bars replayed twice never merge.
 """
 
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
+from datetime import datetime
 
 
 @dataclass
@@ -31,6 +36,7 @@ class Trade:
     win: int | None
     n_fills: int
     status: str
+    replayed_on: str = ""  # file date of a replay trade; "" for live trades
     fill_keys: list = field(default_factory=list)
     position_ids: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
@@ -38,12 +44,22 @@ class Trade:
     def to_payload(self):
         d = asdict(self)
         d.pop("fill_keys")
+        if not self.replayed_on:  # keeps live payloads, and so their fingerprints, unchanged
+            d.pop("replayed_on")
         d["position_ids"] = ",".join(self.position_ids)
         return d
 
 
 def account_type(firm):
     return "SIM" if firm.strip().upper() == "SIM" else "Prop"
+
+
+def local_date(ts_ms):
+    return datetime.fromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d")
+
+
+def is_replay(f):
+    return local_date(f.ts_ms) < f.session_date
 
 
 def fee_per_side(cfg, firm, root):
@@ -101,16 +117,23 @@ def _make_trade(legs, cfg, closed):
         if f.position_id not in pids:
             pids.append(f.position_id)
 
+    trade_id = f"{first.firm}|{first.account}|{first.symbol}|{first.ts_ms}"
+    replayed_on = ""
+    if is_replay(first):
+        replayed_on = first.session_date
+        trade_id += f"|replay {replayed_on}"
+
     return Trade(
-        trade_id=f"{first.firm}|{first.account}|{first.symbol}|{first.ts_ms}",
-        firm=first.firm, account=first.account, account_type=account_type(first.firm),
-        symbol=first.symbol, session_date=first.session_date,
+        trade_id=trade_id,
+        firm=first.firm, account=first.account,
+        account_type="Replay" if replayed_on else account_type(first.firm),
+        symbol=first.symbol, session_date=local_date(first.ts_ms) if replayed_on else first.session_date,
         side="Long" if direction > 0 else "Short", max_qty=max_qty,
         entry_ts=first.ts_ms, entry_price=entry_price,
         exit_ts=exit_ts if closed else None, exit_price=exit_price if closed else None,
         duration_s=(exit_ts - first.ts_ms) / 1000 if closed else None,
         points=points, gross=gross, fees=fees, net=net, win=win,
-        n_fills=len(keys), status="Closed" if closed else "Open",
+        n_fills=len(keys), status="Closed" if closed else "Open", replayed_on=replayed_on,
         fill_keys=keys, position_ids=pids, warnings=warnings,
     )
 
@@ -119,7 +142,7 @@ def build_trades(fills, cfg):
     """Return (trades, {fill_key: trade_id}). Fills must already be unique by key."""
     groups = defaultdict(list)
     for f in fills:
-        groups[(f.firm, f.account, f.symbol)].append(f)
+        groups[(f.firm, f.account, f.symbol, f.session_date if is_replay(f) else "")].append(f)
 
     trades = []
     for group in groups.values():

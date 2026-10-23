@@ -7,9 +7,11 @@ from . import __version__
 from .config import existing_watch_dirs
 from .parser import parse_file, scan_dirs
 from .sheets import SheetsError
-from .trades import build_trades
+from .trades import build_trades, local_date
 
 log = logging.getLogger("journal")
+
+OUTDATED_RECEIVER = "Sheet receiver is outdated (no Replay tab): redeploy apps_script/Code.gs, see README"
 
 
 def fill_payload(f, trade_id):
@@ -23,9 +25,11 @@ def fill_payload(f, trade_id):
 
 def journaled(trades, cfg):
     """Trades opened at or after journal_since_ms. A trade opened earlier stays out even if it
-    closes later, so a cutoff never produces a half trade."""
+    closes later, so a cutoff never produces a half trade. Replay trades carry historical
+    times, so they are cut by the day the replay ran instead."""
     since = cfg.get("journal_since_ms") or 0
-    return [t for t in trades if t.entry_ts >= since]
+    since_day = local_date(since) if since else ""
+    return [t for t in trades if (t.replayed_on >= since_day if t.replayed_on else t.entry_ts >= since)]
 
 
 def chunks(items, size):
@@ -91,7 +95,10 @@ class Syncer:
             return 0, 0
         size = self.cfg["batch_size"]
         payloads = [{"fills": [fill_payload(f, owner.get(f.key, "")) for f in c], "trades": []} for c in chunks(fills, size)]
-        payloads += [{"fills": [], "trades": [t.to_payload() for t in c]} for c in chunks(changed, size)]
+        live = [t for t in changed if not t.replayed_on]
+        replay = [t for t in changed if t.replayed_on]
+        payloads += [{"fills": [], "trades": [t.to_payload() for t in c]} for c in chunks(live, size)]
+        payloads += [{"fills": [], "replay_trades": [t.to_payload() for t in c]} for c in chunks(replay, size)]
         self.state.queue(payloads, fills, changed)
         log.info("queued %d fill(s), %d trade update(s)", len(fills), len(changed))
         return len(fills), len(changed)
@@ -105,6 +112,9 @@ class Syncer:
                 return sent
             try:
                 resp = self.client.post(item["payload"])
+                # An old receiver ignores replay_trades but still answers ok; keep them queued instead.
+                if "replay_trades" in item["payload"] and "replay_trades_upserted" not in resp:
+                    raise SheetsError(OUTDATED_RECEIVER)
             except SheetsError as e:
                 self.state.outbox_failed(item["id"], item["attempts"], e)
                 log.warning("delivery failed (attempt %d): %s", item["attempts"] + 1, e)

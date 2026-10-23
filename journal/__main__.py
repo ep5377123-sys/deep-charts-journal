@@ -68,14 +68,14 @@ def cmd_dry_run(cfg, args):
     if cfg.get("journal_since_ms"):
         print(f"journaling only trades opened since {fmt_ts(cfg['journal_since_ms'])} (journal_since_ms)")
     shown = [t for t in journaled(trades, cfg)
-             if (not args.date or t.session_date == args.date)
+             if (not args.date or args.date in (t.session_date, t.replayed_on))
              and (not args.account or args.account.lower() in f"{t.firm} {t.account}".lower())]
 
     if args.trades:
-        print(f"{'session':10} {'account':38} {'symbol':15} {'side':5} {'qty':>3} {'entry time':19} "
+        print(f"{'session':10} {'account':38} {'type':6} {'symbol':15} {'side':5} {'qty':>3} {'entry time':19} "
               f"{'entry':>11} {'exit':>11} {'points':>8} {'gross':>9} {'net':>9} status")
         for t in shown:
-            print(f"{t.session_date:10} {(t.firm + ' ' + t.account)[:38]:38} {t.symbol:15} {t.side:5} {t.max_qty:>3} "
+            print(f"{t.session_date:10} {(t.firm + ' ' + t.account)[:38]:38} {t.account_type:6} {t.symbol:15} {t.side:5} {t.max_qty:>3} "
                   f"{fmt_ts(t.entry_ts):19} {t.entry_price:>11.2f} {(t.exit_price or 0):>11.2f} "
                   f"{(t.points or 0):>8.2f} {(t.gross or 0):>9.2f} {(t.net or 0):>9.2f} {t.status}")
         print()

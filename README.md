@@ -6,14 +6,20 @@ A small background app watches the fill files Deep Charts writes in real time
 (`Documents\Deepchart\Hist Fills\*.fills`), groups fills into trades (flat → flat per account and
 symbol), works out P&L and fees, and sends them to your Sheet. Nothing inside Deep Charts is changed.
 
-Your Sheet gets four tabs:
+Your Sheet gets these tabs:
 
 | Tab | What's in it |
 |---|---|
 | **Trades** | One row per trade: account, side, size, entry/exit time and price, duration, points, gross, fees, net. Columns **Setup, Grade, Mistakes, Emotion, Notes, Screenshot** are yours: the app never writes to them. |
 | **Fills** | Every raw fill (audit trail; de-duplicated). |
-| **Daily** | P&L, trade count and win % per day and account, plus all accounts combined. |
+| **Daily** | P&L, trade count and win % per day and account, plus all accounts combined. Live trades only. |
+| **Replay** | Trades you take while replaying past data (backtesting), laid out like Trades. *Session Date* is the replayed market day, *Replayed On* is the day you replayed it, and your note columns start after it. |
+| **Replay Daily** | Replay P&L, trade count and win % per replayed market day. |
 | **Status** | One row per PC: last heartbeat, last fill seen, queued uploads, warnings. |
+
+A replay trade is recognised because Deep Charts writes it to the fill file for the day you
+replay, stamped with the historical time. Any fill dated before its file's date counts as replay.
+Replaying today's own session isn't recognised; it would land on Trades as a SIM trade.
 
 Requires Python 3.10+ (Windows). No packages to install.
 
@@ -82,6 +88,10 @@ Log file: `%LOCALAPPDATA%\DeepChartsJournal\journal.log`.
 
 After editing `Code.gs` in Apps Script: *Deploy → Manage deployments → ✏️ → Version: New version →
 Deploy*. The URL stays the same.
+
+Update the receiver before restarting the app after a code update. If the Sheet still runs a
+receiver without the Replay tab, replay trades wait in the queue, and the Status tab says
+"Sheet receiver is outdated". Live trades queued behind them wait too, until you redeploy.
 
 ## Notes and limits
 

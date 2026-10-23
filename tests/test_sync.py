@@ -14,21 +14,29 @@ from .helpers import FIXTURES, cfg
 APEX = "Apex_PA-TEST-01_2026-10-06.fills"
 
 
+REPLAY = "SIM_SIM 1_2026-10-23.fills"
+
+
 class FakeClient:
     def __init__(self):
-        self.posts, self.fail = [], False
+        self.posts, self.fail, self.knows_replay = [], False, True
 
     def post(self, body):
         if self.fail:
             raise SheetsError("network: down")
         self.posts.append(body)
-        return {"ok": True}
+        if not self.knows_replay:  # a receiver deployed before the Replay tab existed
+            return {"ok": True}
+        return {"ok": True, "replay_trades_upserted": len(body.get("replay_trades", []))}
 
     def fills(self):
         return [f for p in self.posts for f in p.get("fills", [])]
 
     def trades(self):
         return [t for p in self.posts for t in p.get("trades", [])]
+
+    def replay_trades(self):
+        return [t for p in self.posts for t in p.get("replay_trades", [])]
 
 
 class SyncTests(unittest.TestCase):
@@ -118,6 +126,33 @@ class SyncTests(unittest.TestCase):
         os.utime(path, ns=(time.time_ns(), time.time_ns() + 1_000_000))
         self.syncer.once()
         self.assertEqual(self.client.posts, [])
+
+    def test_replay_trade_is_cut_by_replay_day_and_sent_apart(self):
+        self.syncer.cfg["journal_since_ms"] = 1792374430000  # 2026-10-18; the replayed bars are from January
+        self.add(REPLAY, REPLAY)
+        self.syncer.once()
+        self.assertEqual(self.client.trades(), [])
+        (t,) = self.client.replay_trades()
+        self.assertEqual((t["account_type"], t["replayed_on"], t["gross"]), ("Replay", "2026-10-23", -400.0))
+        self.assertEqual(len(self.client.fills()), 2)
+
+    def test_replay_from_before_the_cutoff_day_stays_out(self):
+        self.syncer.cfg["journal_since_ms"] = 1792900000000  # 2026-10-25, after the replay ran
+        self.add(REPLAY, REPLAY)
+        self.syncer.once()
+        self.assertEqual(self.client.posts, [])
+
+    def test_outdated_receiver_keeps_replay_trades_queued(self):
+        self.client.knows_replay = False
+        self.add(REPLAY, REPLAY)
+        self.syncer.once()
+        c = self.state.counts()
+        self.assertEqual(c["outbox"], 1)
+        self.assertIn("redeploy", c["outbox_error"])
+        self.client.knows_replay = True
+        self.state.db.execute("UPDATE outbox SET next_try = 0")
+        self.syncer.flush()
+        self.assertEqual(self.state.counts()["outbox"], 0)
 
     def test_sim_can_be_excluded(self):
         self.syncer.cfg["include_sim"] = False

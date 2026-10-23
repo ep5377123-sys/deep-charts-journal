@@ -7,7 +7,8 @@
  *
  * Rules: Fills are append-only and de-duplicated by Fill Key. Trades are upserted by Trade ID,
  * only the auto columns are written (never the notes columns to their right), and a Closed
- * trade is never downgraded to Open.
+ * trade is never downgraded to Open. Replay (backtest) trades follow the same rules on their
+ * own Replay tab, so they never reach Trades or Daily.
  */
 
 const TZ = 'America/New_York';
@@ -20,6 +21,12 @@ const TRADE_COLS = [
   ['Duration', 'duration_s'], ['Points', 'points'], ['Gross P&L', 'gross'], ['Fees', 'fees'],
   ['Net P&L', 'net'], ['Win', 'win'], ['# Fills', 'n_fills'], ['Status', 'status'], ['Source PC', null],
 ];
+// Session Date on the Replay tab is the replayed market day; Replayed On is when you replayed it.
+const REPLAY_COLS = TRADE_COLS.concat([['Replayed On', 'replayed_on']]);
+const TRADE_FORMATS = {
+  session_date: 'yyyy-mm-dd', replayed_on: 'yyyy-mm-dd', entry_ts: 'yyyy-mm-dd hh:mm:ss',
+  exit_ts: 'yyyy-mm-dd hh:mm:ss', duration_s: '[h]:mm:ss', gross: '$#,##0.00', fees: '$#,##0.00', net: '$#,##0.00',
+};
 const USER_COLS = ['Setup', 'Grade', 'Mistakes', 'Emotion', 'Notes', 'Screenshot'];
 const FILL_COLS = [
   ['Fill Key', 'key'], ['Time', 'ts_ms'], ['Session Date', 'session_date'], ['Firm', 'firm'], ['Account', 'account'],
@@ -40,6 +47,11 @@ const DAILY_TOTAL =
   '=QUERY(Trades!A2:U, "select B, count(A), sum(Q), avg(R) where T = \'Closed\' group by B order by B desc ' +
   'label B \'Session (all accounts)\', count(A) \'Trades\', sum(Q) \'Net\', avg(R) \'Win %\' ' +
   'format B \'yyyy-mm-dd\', sum(Q) \'$#,##0.00\', avg(R) \'0%\'", 0)';
+const REPLAY_DAILY =
+  '=QUERY(Replay!A2:V, "select B, count(A), sum(O), sum(P), sum(Q), avg(R) where T = \'Closed\' ' +
+  'group by B order by B desc label B \'Market Day\', count(A) \'Trades\', sum(O) \'Gross\', sum(P) \'Fees\', ' +
+  'sum(Q) \'Net\', avg(R) \'Win %\' format B \'yyyy-mm-dd\', sum(O) \'$#,##0.00\', sum(P) \'$#,##0.00\', ' +
+  'sum(Q) \'$#,##0.00\', avg(R) \'0%\'", 0)';
 
 function doGet() {
   return ContentService.createTextOutput('Deep Charts Journal receiver is running.');
@@ -64,7 +76,8 @@ function doPost(e) {
     const res = {
       ok: true,
       fills_added: addFills_(sh.fills, body.fills || [], body.pc || '', tz),
-      trades_upserted: upsertTrades_(sh.trades, body.trades || [], body.pc || '', tz),
+      trades_upserted: upsertTrades_(sh.trades, TRADE_COLS, body.trades || [], body.pc || '', tz),
+      replay_trades_upserted: upsertTrades_(sh.replay, REPLAY_COLS, body.replay_trades || [], body.pc || '', tz),
     };
     if (body.heartbeat) heartbeat_(sh.status, body.heartbeat);
     SpreadsheetApp.flush();
@@ -91,13 +104,7 @@ function setup_(ss) {
       trades = ss.insertSheet('Trades');
     }
     ss.setSpreadsheetTimeZone(TZ);
-    const headers = TRADE_COLS.map(c => c[0]).concat(USER_COLS);
-    trades.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
-    trades.setFrozenRows(1);
-    formatColumns_(trades, TRADE_COLS, {
-      session_date: 'yyyy-mm-dd', entry_ts: 'yyyy-mm-dd hh:mm:ss', exit_ts: 'yyyy-mm-dd hh:mm:ss',
-      duration_s: '[h]:mm:ss', gross: '$#,##0.00', fees: '$#,##0.00', net: '$#,##0.00',
-    });
+    initTradeSheet_(trades, TRADE_COLS);
   }
   let fills = ss.getSheetByName('Fills');
   if (!fills) {
@@ -111,13 +118,28 @@ function setup_(ss) {
     daily.getRange(1, 1).setFormula(DAILY_BY_ACCOUNT);
     daily.getRange(1, 11).setFormula(DAILY_TOTAL);
   }
+  let replay = ss.getSheetByName('Replay');
+  if (!replay) {
+    replay = ss.insertSheet('Replay');
+    initTradeSheet_(replay, REPLAY_COLS);
+  }
+  if (!ss.getSheetByName('Replay Daily')) {
+    ss.insertSheet('Replay Daily').getRange(1, 1).setFormula(REPLAY_DAILY);
+  }
   let status = ss.getSheetByName('Status');
   if (!status) {
     status = ss.insertSheet('Status');
     status.getRange(1, 1, 1, STATUS_COLS.length).setValues([STATUS_COLS]).setFontWeight('bold');
     status.setFrozenRows(1);
   }
-  return { trades, fills, status };
+  return { trades, fills, replay, status };
+}
+
+function initTradeSheet_(sheet, cols) {
+  const headers = cols.map(c => c[0]).concat(USER_COLS);
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+  sheet.setFrozenRows(1);
+  formatColumns_(sheet, cols, TRADE_FORMATS);
 }
 
 function formatColumns_(sheet, cols, formats) {
@@ -130,7 +152,7 @@ function formatColumns_(sheet, cols, formats) {
 function cell_(field, value, tz) {
   if (value === null || value === undefined) return '';
   if (field === 'entry_ts' || field === 'exit_ts' || field === 'ts_ms') return new Date(value);
-  if (field === 'session_date') return Utilities.parseDate(value, tz, 'yyyy-MM-dd');
+  if (field === 'session_date' || field === 'replayed_on') return Utilities.parseDate(value, tz, 'yyyy-MM-dd');
   if (field === 'duration_s') return value / 86400;
   if (TEXT_FIELDS.indexOf(field) >= 0) return String(value);
   return value;
@@ -154,10 +176,10 @@ function addFills_(sheet, fills, pc, tz) {
   return rows.length;
 }
 
-function upsertTrades_(sheet, trades, pc, tz) {
+function upsertTrades_(sheet, cols, trades, pc, tz) {
   if (!trades.length) return 0;
-  const n = TRADE_COLS.length;
-  const statusIdx = TRADE_COLS.findIndex(c => c[1] === 'status');
+  const n = cols.length;
+  const statusIdx = cols.findIndex(c => c[1] === 'status');
   const last = sheet.getLastRow();
   const existing = last > 1 ? sheet.getRange(2, 1, last - 1, n).getValues() : [];
   const where = new Map();
@@ -165,7 +187,7 @@ function upsertTrades_(sheet, trades, pc, tz) {
   const appends = [];
   let count = 0;
   trades.forEach(t => {
-    const row = rowFor_(TRADE_COLS, t, pc, tz);
+    const row = rowFor_(cols, t, pc, tz);
     const hit = where.get(String(t.trade_id));
     if (!hit) {
       where.set(String(t.trade_id), { rows: appends, i: appends.length, sheetRow: null });

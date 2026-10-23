@@ -89,21 +89,25 @@ test('bad token is refused and nothing is written', () => {
   assert.strictEqual(sheet('Fills'), null);
 });
 
-test('ping creates the four tabs, reusing the blank Sheet1 as Trades', () => {
+test('ping creates the tabs, reusing the blank Sheet1 as Trades', () => {
   const { post, ss, sheet } = load();
   assert.strictEqual(post({ ping: true }).ok, true);
-  assert.deepStrictEqual(ss.getSheets().map(s => s.getName()).sort(), ['Daily', 'Fills', 'Status', 'Trades']);
+  assert.deepStrictEqual(ss.getSheets().map(s => s.getName()).sort(),
+    ['Daily', 'Fills', 'Replay', 'Replay Daily', 'Status', 'Trades']);
   assert.strictEqual(sheet('Trades').data[0][0], 'Trade ID');
   assert.strictEqual(sheet('Trades').data[0][21], 'Setup');
+  assert.strictEqual(sheet('Replay').data[0][21], 'Replayed On');
+  assert.strictEqual(sheet('Replay').data[0][22], 'Setup');
   assert.strictEqual(ss.tz, 'America/New_York');
   assert.match(sheet('Daily').formulas['1,1'], /^=QUERY\(Trades!A2:U/);
+  assert.match(sheet('Replay Daily').formulas['1,1'], /^=QUERY\(Replay!A2:V/);
 });
 
 test('same payload twice gives one row per fill and per trade', () => {
   const { post, sheet } = load();
   const body = { fills: [fill('a#0'), fill('a#1'), fill('b#0')], trades: [trade()] };
-  assert.deepStrictEqual(post(body), { ok: true, fills_added: 3, trades_upserted: 1 });
-  assert.deepStrictEqual(post(body), { ok: true, fills_added: 0, trades_upserted: 1 });
+  assert.deepStrictEqual(post(body), { ok: true, fills_added: 3, trades_upserted: 1, replay_trades_upserted: 0 });
+  assert.deepStrictEqual(post(body), { ok: true, fills_added: 0, trades_upserted: 1, replay_trades_upserted: 0 });
   assert.strictEqual(sheet('Fills').getLastRow(), 4);
   assert.strictEqual(sheet('Trades').getLastRow(), 2);
 });
@@ -138,6 +142,29 @@ test('long ids are written as text and times as dates', () => {
   const t = sheet('Trades').data[1];
   assert.strictEqual(Object.prototype.toString.call(t[8]), "[object Date]");
   assert.strictEqual(t[12], 362.28 / 86400);
+});
+
+const replay = (extra = {}) => trade({
+  trade_id: 'SIM|SIM 1|NQ-202603-CME|1767627131991|replay 2026-10-23', session_date: '2026-01-05', firm: 'SIM',
+  account: 'SIM 1', account_type: 'Replay', symbol: 'NQ-202603-CME', replayed_on: '2026-10-23', ...extra,
+});
+
+test('replay trades go to the Replay tab only and keep their notes', () => {
+  const { post, sheet } = load();
+  const res = post({ replay_trades: [replay({ status: 'Open', gross: null })] });
+  assert.deepStrictEqual(res, { ok: true, fills_added: 0, trades_upserted: 0, replay_trades_upserted: 1 });
+  assert.strictEqual(sheet('Trades').getLastRow(), 1);
+  const r = sheet('Replay');
+  assert.strictEqual(r.data[1][0], 'SIM|SIM 1|NQ-202603-CME|1767627131991|replay 2026-10-23');
+  assert.strictEqual(r.data[1][4], 'Replay');
+  assert.deepStrictEqual([r.data[1][1], r.data[1][21]].map(d => d.toISOString().slice(0, 10)), ['2026-01-05', '2026-10-23']);
+  r.getRange(2, 23, 1, 1).setValues([['ORB retest']]);
+  post({ replay_trades: [replay()] });
+  post({ replay_trades: [replay({ status: 'Open', gross: null })] });
+  assert.strictEqual(r.getLastRow(), 2);
+  assert.strictEqual(r.data[1][19], 'Closed');
+  assert.strictEqual(r.data[1][14], -109.5);
+  assert.strictEqual(r.data[1][22], 'ORB retest');
 });
 
 test('heartbeat upserts one row per PC', () => {

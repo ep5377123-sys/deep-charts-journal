@@ -1,6 +1,6 @@
 import unittest
 
-from journal.trades import build_trades
+from journal.trades import build_trades, is_replay
 
 from .helpers import cfg, fixture_fills, text_fills
 
@@ -68,6 +68,44 @@ class SyntheticTests(unittest.TestCase):
         a = build_trades(text_fills([(1000, 100.0, 1), (2000, 101.0, -1)]), cfg())[0][0]
         b = build_trades(text_fills([(1000, 100.0, 1), (2000, 101.0, -1)], name="other-pc.fills"), cfg())[0][0]
         self.assertEqual(a.trade_id, b.trade_id)
+
+
+# 2026-01-05 15:32 UTC: a replayed January bar, written to files dated in October.
+JAN = 1767627131991
+
+
+class ReplayTests(unittest.TestCase):
+    def test_replay_fixture_is_one_replay_trade(self):
+        # Replayed 2026-10-23: NQ March long 25684.25 -> 25664.25 = -20 pts x 1 x $20.
+        (t,), _ = build_trades(fixture_fills("SIM_SIM 1_2026-10-23.fills"), cfg())
+        self.assertEqual((t.account_type, t.status, t.side, t.gross), ("Replay", "Closed", "Long", -400.0))
+        self.assertEqual((t.session_date, t.replayed_on), ("2026-01-05", "2026-10-23"))
+        self.assertEqual(t.trade_id, "SIM|SIM 1|NQ-202603-CME|1767627131991|replay 2026-10-23")
+        self.assertEqual(t.to_payload()["replayed_on"], "2026-10-23")
+
+    def test_live_fixtures_are_never_replay(self):
+        for name in ["Apex_PA-TEST-01_2026-10-06.fills", "Lucid_TEST-RESTART_2026-10-13.fills",
+                     "Lucid_TEST-PARTIAL_2026-10-16.fills", "Lucid Account_TEST-SCALE_2026-08-19.fills"]:
+            fills = fixture_fills(name)
+            self.assertFalse([f for f in fills if is_replay(f)], name)
+            trades, _ = build_trades(fills, cfg())
+            self.assertTrue(all(t.replayed_on == "" and "replay" not in t.trade_id for t in trades), name)
+            self.assertTrue(all("replayed_on" not in t.to_payload() for t in trades), name)
+
+    def test_same_bars_replayed_on_two_days_are_separate_trades(self):
+        day1 = text_fills([(JAN, 100.0, 1), (JAN + 60_000, 101.0, -1)], date="2026-10-20", name="SIM_SIM 1_2026-10-20.fills")
+        day2 = text_fills([(JAN + 1000, 100.0, 1), (JAN + 30_000, 99.0, -1)], date="2026-10-21", name="SIM_SIM 1_2026-10-21.fills")
+        trades, _ = build_trades(day1 + day2, cfg())
+        self.assertEqual([(t.replayed_on, t.gross, t.status) for t in trades],
+                         [("2026-10-20", 2.0, "Closed"), ("2026-10-21", -2.0, "Closed")])
+
+    def test_live_and_replay_fills_in_one_file_stay_apart(self):
+        live = 1792712885000  # 2026-10-22 19:48 New York, the file's own day
+        fills = text_fills([(live, 200.0, 1), (JAN, 100.0, -1), (JAN + 5000, 99.0, 1), (live + 5000, 201.0, -1)],
+                           date="2026-10-22", name="SIM_SIM 1_2026-10-22.fills")
+        trades, _ = build_trades(fills, cfg())
+        self.assertEqual(sorted((t.account_type, t.side, t.gross) for t in trades),
+                         [("Replay", "Short", 2.0), ("SIM", "Long", 2.0)])
 
 
 if __name__ == "__main__":
